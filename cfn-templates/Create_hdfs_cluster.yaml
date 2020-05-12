@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion:       '2010-09-09'
+Description:                    "Template to create InstanceProfile for EC2-S3 access and create S3 bucket for config files"
+Resources:
+  hdfsconfigs3bucket:
+    Type:                       AWS::S3::Bucket
+    DeletionPolicy:             Retain
+  hdfsawsrole:                  #Create role with trusted Principal (Ec2)
+    Type:                       AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version:                '2012-10-17'
+        Statement:
+        - Effect:               Allow
+          Principal:
+            Service:            ec2.amazonaws.com
+          Action:               sts:AssumeRole
+  hdfsinstanceprofile:          #Wrap role created above in InstanceProfile
+    Type:                       AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - Ref:                    hdfsawsrole
+  hdfsawspolicy:                #Associate policy (permissions) with the role
+    Type:                       AWS::IAM::Policy
+    Properties:
+      PolicyName:               s3bucketaccess
+      Roles:
+      - Ref:                    hdfsawsrole
+      PolicyDocument:
+        Version:                '2012-10-17'
+        Statement:
+        - Effect:               Allow
+          Action:               s3:*
+          Resource:
+          -                     !GetAtt hdfsconfigs3bucket.Arn
+          -                     !Join
+            -                   ''
+            - -                 !GetAtt hdfsconfigs3bucket.Arn
+              -                 "/*"
+Outputs:
+  HdfsInstanceProfile:
+    Value:                      !Ref hdfsinstanceprofile
+  HdfsSharedBucket:
+    Value:                      !Ref hdfsconfigs3bucket
+    AWSTemplateFormatVersion:     '2010-09-09'
+Description:                  "Master template to create HDFS cluster on AWS"
+Parameters:
+  GitHubRepo:
+    Description:              Enter Github repositary holding your scripts
+    Type:                     String
+    Default:                  https://github.com/Simran-Barnwal/hdfs-aws-config.git
+  HDFSImage:
+    Description:              Enter base image-id for hdfs cluster
+    Type:                     String
+    Default:                  ami-b1e7c6de
+  LambdaRoleArn:
+    Description:              Provide Serivce Role Arn for Lambda
+    Type:                     String
+    Default:                  arn:aws:iam::454770763022:role/lambda_basic_execution
+  KeyName:
+    Description:              Select keyname to use with your instance
+    Type:                     AWS::EC2::KeyPair::KeyName
+Resources:
+  hdfsinstancerole:           #Create InstanceProfile for S3 access and S3 bucket to hold config files
+    Type:                     AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL:            https://myaws-bucket713976917.s3.amazonaws.com/Create_Instance_Role.yaml
+  hdfsnetwork:                #Create Multi-AZ VPC and private-public subnets , routing table , security groups and IGW
+    Type:                     AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL:            https://myaws-bucket713976917.s3.amazonaws.com/Create_Network.yaml
+  hdfsmasterinstance:         #Create Master node for HDFS cluster
+    Type:                     AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL:            https://myaws-bucket713976917.s3.amazonaws.com/Create_Master.yaml
+      Parameters:
+        KeyName:              !Ref  KeyName
+        HDFSImage:            !Ref  HDFSImage
+        GitHubRepo:           !Ref  GitHubRepo
+        HdfsInstanceProfile:  !GetAtt hdfsinstancerole.Outputs.HdfsInstanceProfile
+        HDFSSecurityGroup:    !GetAtt hdfsnetwork.Outputs.HDFSSecurityGroup
+        MasterSubnet:         !GetAtt hdfsnetwork.Outputs.AZ1PubSubnet
+        HdfsSharedBucket:     !GetAtt hdfsinstancerole.Outputs.HdfsSharedBucket
+  hdfsasg:                    #Create AutoScalingGroup which can create extra nodes for cluster if required, initial min,max is 0
+    Type:                     AWS::CloudFormation::Stack
+    DependsOn:                hdfsmasterinstance
+    Properties:
+      TemplateURL:            https://myaws-bucket713976917.s3.amazonaws.com/Create_ASG.yaml
+    
+      Parameters:
+        KeyName:              !Ref KeyName
+        HDFSImage:            !Ref  HDFSImage
+        GitHubRepo:           !Ref  GitHubRepo
+        HdfsInstanceProfile:  !GetAtt hdfsinstancerole.Outputs.HdfsInstanceProfile
+        HDFSSecurityGroup:    !GetAtt hdfsnetwork.Outputs.HDFSSecurityGroup
+        ASGSubnet1:           !GetAtt hdfsnetwork.Outputs.AZ1PubSubnet
+        ASGSubnet2:           !GetAtt hdfsnetwork.Outputs.AZ2PubSubnet
+        HdfsSharedBucket:     !GetAtt hdfsinstancerole.Outputs.HdfsSharedBucket
+        HdfsTopicArn:         !GetAtt hdfslambdafunction.Outputs.HDFSSnsTopicArn
+  hdfsslaveinstance:          #Create nodes for HDFS cluster, so initial cluster has one master and one slave node
+    Type:                     AWS::CloudFormation::Stack
+    DependsOn:                hdfsmasterinstance
+    Properties:
+      TemplateURL:            https://myaws-bucket713976917.s3.amazonaws.com/Create_Slave.yaml
+      Parameters:
+        KeyName:              !Ref  KeyName
+        HDFSImage:            !Ref  HDFSImage
+        GitHubRepo:           !Ref  GitHubRepo
+        HdfsInstanceProfile:  !GetAtt hdfsinstancerole.Outputs.HdfsInstanceProfile
+        HDFSSecurityGroup:    !GetAtt hdfsnetwork.Outputs.HDFSSecurityGroup
+        SlaveSubnet:          !GetAtt hdfsnetwork.Outputs.AZ1PubSubnet
+        HdfsSharedBucket:     !GetAtt hdfsinstancerole.Outputs.HdfsSharedBucket
+  hdfslambdafunction:         #Create nodes for HDFS cluster, so initial cluster has one master and one slave node
+    Type:                     AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL:            https://myaws-bucket713976917.s3.amazonaws.com/Create_Lambda.yaml
+      Parameters:
+        HdfsSharedBucket:     !GetAtt hdfsinstancerole.Outputs.HdfsSharedBucket
+        LambdaRoleArn:        !Ref LambdaRoleArn
+Outputs:
+  HdfsS3Bucket:
+    Value:                    !GetAtt hdfsinstancerole.Outputs.HdfsSharedBucket
+  NameNodeUrl:
+    Value:                    !Join
+     -                        ""
+     - -                      'http://'
+       -                      !GetAtt hdfsmasterinstance.Outputs.DnsName
+       -                      ':50070/'
+  ResourceManagerUrl:
+    Value:                    !Join
+     -                        ""
+     - -                      'http://'
+       -                      !GetAtt hdfsmasterinstance.Outputs.DnsName
+       -                      ':8088/'
